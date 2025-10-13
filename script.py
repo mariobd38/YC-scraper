@@ -5,6 +5,8 @@ import json
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from datetime import datetime, timezone
+
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -249,10 +251,12 @@ def scrape_jobs_for_company(driver, company_url, company_name):
         
         for job_el in job_elements:
             try:
-                # Extract job title from the link
+                # Extract job title and URL from the link
                 job_title = None
+                job_url = None
                 try:
                     title_link = job_el.find_element(By.XPATH, ".//a[contains(@href, '/jobs/')]")
+                    job_url = title_link.get_attribute("href")
                     job_title = title_link.text.strip()
                 except:
                     continue
@@ -280,17 +284,73 @@ def scrape_jobs_for_company(driver, company_url, company_name):
                             experience = text
                         # Location: first one that's not salary or experience
                         elif not location and not '$' in text:
+                            print('THIS IS THE LOCATION', text)
                             location = text
-                except:
+                except Exception:
                     pass
                 
+                # Extract date posted from job URL
+                date_posted = None
+                date_posted_str = None
+                if job_url:
+                    try:
+                        # Open job URL in new tab
+                        driver.execute_script("window.open(arguments[0], '_blank');", job_url)
+                        WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > 1)
+                        handles = driver.window_handles
+                        driver.switch_to.window(handles[-1])
+                        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                        
+                        # Find JSON-LD script tags
+                        scripts = driver.find_elements(By.XPATH, "//script[@type='application/ld+json']")
+                        for sc in scripts:
+                            try:
+                                txt = sc.get_attribute("textContent") or sc.get_attribute("innerHTML") or ""
+                                if not txt.strip():
+                                    continue
+                                data = json.loads(txt)
+                                date_str = _find_date_posted_in_json(data)
+                                if date_str:
+                                    dt = _parse_iso_guess_to_utc(date_str)
+                                    if dt:
+                                        date_posted = dt
+                                        date_posted_str = date_str
+                                        break
+                            except Exception:
+                                continue
+                        
+                        # Close tab and switch back
+                        driver.close()
+                        driver.switch_to.window(handles[0])
+                    except Exception:
+                        # If error, make sure we're back on main window
+                        try:
+                            handles = driver.window_handles
+                            if len(handles) > 1:
+                                driver.close()
+                            driver.switch_to.window(handles[0])
+                        except:
+                            pass
+                
+                # Filter: only include jobs with year >= 2025 AND keyword match
+                if date_posted and date_posted < datetime(2025, 8, 4, tzinfo=timezone.utc):
+                    continue
+                
+                # Check for keywords in job title
+                keywords = ["engineering", "engineer", "developer"]
+                if not any(keyword in job_title.lower() for keyword in keywords):
+                    continue
+
                 jobs.append({
                     "company_name": company_name,
                     "company_url": company_url,
+                    "job_url": job_url,
                     "job_title": job_title,
                     "location": location,
                     "salary": salary,
-                    "experience": experience
+                    "experience": experience,
+                    "date_posted": date_posted.isoformat() if date_posted else None,
+                    "date_posted_raw": date_posted_str
                 })
                 
             except Exception:
@@ -302,6 +362,57 @@ def scrape_jobs_for_company(driver, company_url, company_name):
     
     return jobs
 
+
+def _find_date_posted_in_json(obj):
+    """Recursively find a datePosted string in a JSON-LD structure."""
+    if isinstance(obj, dict):
+        # Direct JobPosting
+        t = obj.get("@type")
+        if (t == "JobPosting" or (isinstance(t, list) and "JobPosting" in t)) and obj.get("datePosted"):
+            return obj.get("datePosted")
+        # @graph or nested
+        if "@graph" in obj:
+            res = _find_date_posted_in_json(obj["@graph"])
+            if res:
+                return res
+        for v in obj.values():
+            res = _find_date_posted_in_json(v)
+            if res:
+                return res
+    elif isinstance(obj, list):
+        for it in obj:
+            res = _find_date_posted_in_json(it)
+            if res:
+                return res
+    return None
+
+def _parse_iso_guess_to_utc(dt_str: str) -> datetime | None:
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    try:
+        # Handle trailing Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        # Fallback common formats
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(dt_str, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except Exception:
+                pass
+    return None
 
 def scrape_jobs_worker(company_data, progress_counter, total, lock, headless=True):
     """Worker function that creates its own driver and scrapes jobs for one company."""
@@ -342,7 +453,7 @@ def save_jobs_outputs(jobs, out_json="jobs.json", out_csv="jobs.csv"):
     with open(out_json, "w") as f:
         json.dump(jobs, f, indent=2)
     
-    fields = ["company_name", "company_url", "job_title", "location", "salary", "experience"]
+    fields = ["company_name", "company_url", "job_url", "job_title", "location", "salary", "experience", "date_posted", "date_posted_raw"]
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -429,3 +540,6 @@ if __name__ == "__main__":
     main()
 
 
+
+# use both USA and Remote filters
+# parse location, salary, experience
